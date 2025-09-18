@@ -1,26 +1,79 @@
 ---
 # =====================================================================
 # Playbook: create_mongodb_atls_org.yml
-# Description:
-#   This playbook provisions a new MongoDB Atlas Organization using the
-#   MongoDB Atlas API. It assigns the requesting ACL group as the org
-#   owner (instead of the user running the job), retrieves the Org ID,
-#   and sends an email notification with Org details.
+#
+# What this does (high level)
+# ---------------------------
+# 1) Creates a new MongoDB Atlas Organization via the Atlas Admin API.
+# 2) Makes the *requesting ACL group* the **ORG_OWNER** instead of the
+#    person running the job (prevents accidental self-ownership).
+# 3) Reads back Organization details (ID, creator, members, etc.).
+# 4) Emails the requester with the Org name, Org ID, and the extra details.
+#
+# Why we changed it
+# -----------------
+# • Old behavior: the job runner automatically became Organization Owner.
+# • New behavior: we assign ownership to the *team’s ACL group* requesting it.
+# • We also include the Organization ID in the notification email.
+#
+# Inputs (typically provided by an Ansible Tower/AAP Survey)
+# ---------------------------------------------------------
+# • org_name_input        : Name of the new MongoDB Atlas Organization.
+# • acl_group_input       : Identifier of the requesting ACL group to own the Org.
+# • requester_email       : Email address to receive the confirmation message.
+#
+# Secrets & prerequisites
+# -----------------------
+# • Atlas API keys are read from environment variables in the execution
+#   environment (or Tower credential injection):
+#     - ATLAS_PUBLIC_KEY
+#     - ATLAS_PRIVATE_KEY
+# • Outbound HTTPS to cloud.mongodb.com is required.
+# • SMTP host reachable from the execution environment for the mail step.
+#
+# API endpoints used (Atlas Admin API)
+# ------------------------------------
+# • POST  /api/atlas/v1.0/orgs
+#     - Creates an Organization. Response includes the Org "id".
+# • POST  /api/atlas/v1.0/orgs/{orgId}/groups
+#     - Assigns an ACL group with the given role (here: ORG_OWNER).
+# • GET   /api/atlas/v1.0/orgs/{orgId}
+#     - Fetches details like created/createdBy and users list (members).
+#
+# Notes
+# -----
+# • Error handling checks the expected HTTP status codes for each request.
+# • If your environment uses a different concept than "groups" for ACL,
+#   adapt the "Assign ACL Group as Owner" task to the proper endpoint.
+# • Replace "smtp.company.com" with your SMTP relay.
+#
 # Author: DB Engineering Team
 # =====================================================================
 
 - name: Create MongoDB Atlas Organization
   hosts: localhost
   gather_facts: no
+
   vars:
+    # --- Static config (edit only if endpoints change) ---
+    atlas_base_url: "https://cloud.mongodb.com/api/atlas/v1.0"
+
+    # --- Secrets (injected via env/Tower creds) ---
     atlas_api_public_key: "{{ lookup('env', 'ATLAS_PUBLIC_KEY') }}"
     atlas_api_private_key: "{{ lookup('env', 'ATLAS_PRIVATE_KEY') }}"
-    atlas_base_url: "https://cloud.mongodb.com/api/atlas/v1.0"
+
+    # --- From Tower/AAP Survey (user inputs) ---
     org_name: "{{ org_name_input }}"
     requester_acl_group: "{{ acl_group_input }}"
     notify_email: "{{ requester_email }}"
 
+    # --- Email settings (adjust to your SMTP) ---
+    smtp_host: "smtp.company.com"
+    smtp_port: 25
+
   tasks:
+
+    # 1) Create the Organization
     - name: Create Organization in MongoDB Atlas
       uri:
         url: "{{ atlas_base_url }}/orgs"
@@ -35,10 +88,14 @@
         status_code: 201
       register: org_response
 
+    # 2) Save the Org ID for later steps (email + owner assignment)
     - name: Extract Org ID
       set_fact:
         org_id: "{{ org_response.json.id }}"
 
+    # 3) Assign the requesting ACL group as ORG_OWNER (not the job runner)
+    #    If your Atlas setup uses a different endpoint/model for teams/groups,
+    #    update the URL/body below accordingly.
     - name: Assign ACL Group as Owner
       uri:
         url: "{{ atlas_base_url }}/orgs/{{ org_id }}/groups"
@@ -51,14 +108,24 @@
           groupId: "{{ requester_acl_group }}"
           roleName: "ORG_OWNER"
         status_code: 201
+      register: owner_assign_response
 
-    - name: Send Email Notification
-      mail:
-        host: "smtp.company.com"
-        port: 25
-        to: "{{ notify_email }}"
-        subject: "MongoDB Atlas Org Created: {{ org_name }}"
-        body: |
+    # 4) Read back Org details to enrich the email
+    - name: Fetch Organization Details
+      uri:
+        url: "{{ atlas_base_url }}/orgs/{{ org_id }}"
+        method: GET
+        user: "{{ atlas_api_public_key }}"
+        password: "{{ atlas_api_private_key }}"
+        force_basic_auth: yes
+        return_content: yes
+        status_code: 200
+      register: org_details
+
+    # 5) Prepare a human-friendly email body (handles empty lists safely)
+    - name: Build Email Body with Org Details
+      set_fact:
+        org_email_body: |
           Hello Team,
 
           A new MongoDB Atlas Organization has been created.
@@ -67,5 +134,28 @@
           Organization ID   : {{ org_id }}
           Assigned ACL Group: {{ requester_acl_group }}
 
+          Additional Details:
+          Created By  : {{ org_details.json.createdBy.username | default(org_details.json.createdBy | default('N/A')) }}
+          Created Date: {{ org_details.json.created | default('N/A') }}
+
+          Members:
+          {% set members = org_details.json.users | default([]) %}
+          {% if members|length == 0 %}
+            - No members found
+          {% else %}
+          {%   for user in members %}
+            - {{ user.username | default(user.emailAddress | default('unknown')) }}{{ ' (' ~ (user.roleName | default('role unknown')) ~ ')' }}
+          {%   endfor %}
+          {% endif %}
+
           Regards,
           DB Engineering Automation
+
+    # 6) Send the notification email to the requester
+    - name: Send Email Notification
+      mail:
+        host: "{{ smtp_host }}"
+        port: "{{ smtp_port }}"
+        to: "{{ notify_email }}"
+        subject: "MongoDB Atlas Org Created: {{ org_name }}"
+        body: "{{ org_email_body }}"
